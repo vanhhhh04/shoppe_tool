@@ -1,6 +1,6 @@
 import requests
 from typing import Optional, Dict, Any
-
+from error_code_handler import HandleErrorCode
 class ViOTPClient:
     def __init__(self, token: str):
         """
@@ -9,6 +9,7 @@ class ViOTPClient:
         """
         self.token = token
         self.base_url = "https://api.viotp.com"
+        self.error_code = HandleErrorCode
 
     def request_number(self, service_id: int, network: Optional[str] = None, 
                        prefix: Optional[str] = None, except_prefix: Optional[str] = None, 
