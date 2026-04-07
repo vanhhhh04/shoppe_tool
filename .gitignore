@@ -2,6 +2,9 @@
 # Posted by seanrose, modified by community. See post 'Timeline' for change history
 # Retrieved 2026-04-03, License - CC BY-SA 3.0
 
+venv/
+.venv/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

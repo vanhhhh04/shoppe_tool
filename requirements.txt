@@ -4,3 +4,5 @@ idna==3.11
 python-dotenv==1.2.2
 requests==2.33.1
 urllib3==2.6.3
+playwright>=1.49.0
+playwright-stealth>=2.0.0
