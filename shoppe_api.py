@@ -10,6 +10,7 @@ dễ bị hạn chế. Cách bền: Playwright/Selenium trong context trình duy
 from __future__ import annotations
 
 import requests
+import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
@@ -46,6 +47,7 @@ class ShopeeClient:
         *,
         referer: str = "https://shopee.vn/buyer/reset?scenario=7",
         sync_csrf_from_cookie: bool = True,
+        rotate_proxy_after_seconds: float = 0.0,
     ):
         """
         :param cookies: Chuỗi Cookie đầy đủ từ trình duyệt (khuyến nghị khi chưa dùng automation).
@@ -54,11 +56,16 @@ class ShopeeClient:
         :param session: ``requests.Session`` tùy chỉnh; mặc định tạo session mới (giữ jar cookie sau warmup).
         :param referer: Referer khớp ngữ cảnh trang (reset password, đăng nhập, …).
         :param sync_csrf_from_cookie: Nếu ``cookies`` có ``csrftoken=``, gán luôn ``X-CSRFToken``.
+        :param rotate_proxy_after_seconds:
+            > 0: tự gọi ``prepare_new_session()`` khi quá thời lượng này;
+            <= 0: chỉ ``ensure_valid()`` (không ép đổi IP theo thời gian).
         """
         self.base_url = "https://shopee.vn"
         self.proxies = proxies
         self.kiot_proxy = kiot_proxy
         self._session = session if session is not None else requests.Session()
+        self.rotate_proxy_after_seconds = max(0.0, float(rotate_proxy_after_seconds))
+        self._last_proxy_rotate_at: Optional[float] = None
 
         self.headers: Dict[str, str] = {
             "User-Agent": (
@@ -94,7 +101,19 @@ class ShopeeClient:
 
     def _effective_proxies(self) -> Optional[Dict[str, str]]:
         if self.kiot_proxy is not None:
-            self.kiot_proxy.ensure_valid()
+            now = time.time()
+            should_rotate = (
+                self.rotate_proxy_after_seconds > 0
+                and (
+                    self._last_proxy_rotate_at is None
+                    or (now - self._last_proxy_rotate_at) >= self.rotate_proxy_after_seconds
+                )
+            )
+            if should_rotate:
+                self.kiot_proxy.prepare_new_session()
+                self._last_proxy_rotate_at = now
+            else:
+                self.kiot_proxy.ensure_valid()
             return self.kiot_proxy.as_requests_proxies()
         return self.proxies
 

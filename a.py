@@ -32,15 +32,18 @@ CHECK_PATH = "/api/v4/account/basic/check_account_exist"
 SHOPEE_ERROR_RISK_GENERIC = 90309999
 
 # Pool UA/viewport — mỗi ``BrowserContext`` = một fingerprint nhẹ (cùng Kiot: 1 IP / session).
+# Chỉ Chrome/Edge: Playwright dùng Chromium; ``playwright_stealth`` parse ``Chrome/<ver>`` cho Sec-CH-UA —
+# Firefox UA gây crash (regex trả None trong thư viện).
 _DESKTOP_USER_AGENTS: Tuple[str, ...] = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
 )
+
+_UA_HAS_CHROME_VERSION = re.compile(r"Chrome/\d+", re.IGNORECASE)
 
 _VIEWPORTS: Tuple[Dict[str, int], ...] = (
     {"width": 1920, "height": 1080},
@@ -62,11 +65,16 @@ def random_viewport() -> Dict[str, int]:
 
 def _prepare_shopee_page(page: Page, *, user_agent: str) -> None:
     """Stealth khớp ``user_agent`` của context (gọi ngay sau ``new_page()``, trước ``goto``)."""
-    Stealth(
-        navigator_languages_override=("vi-VN", "vi"),
-        navigator_user_agent_override=user_agent,
-        navigator_platform_override="Win32",
-    ).apply_stealth_sync(page)
+    stealth_kw: Dict[str, Any] = {
+        "navigator_languages_override": ("vi-VN", "vi"),
+        "navigator_user_agent_override": user_agent,
+        "navigator_platform_override": "Win32",
+    }
+    if not _UA_HAS_CHROME_VERSION.search(user_agent):
+        # Tránh __init__ gọi _get_greased_chrome_sec_ua_ch khi không có "Chrome/<ver>".
+        stealth_kw["sec_ch_ua"] = False
+        stealth_kw["sec_ch_ua_override"] = ""
+    Stealth(**stealth_kw).apply_stealth_sync(page)
 
 
 def _random_delay_before_account_check() -> None:
@@ -208,6 +216,7 @@ class ShopeeBrowserClient:
         *,
         kiot_proxy: Optional[Proxy] = None,
         rotate_kiot_each_session: bool = True,
+        kiot_rotate_after_seconds: float = 0.0,
         debug_dir: Optional[Union[str, Path]] = None,
         timing: Optional[ShopeeUiTiming] = None,
     ):
@@ -215,11 +224,13 @@ class ShopeeBrowserClient:
         self.use_system_chrome = use_system_chrome
         self.kiot_proxy = kiot_proxy
         self.rotate_kiot_each_session = rotate_kiot_each_session
+        self.kiot_rotate_after_seconds = max(0.0, float(kiot_rotate_after_seconds))
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.timing = timing if timing is not None else ShopeeUiTiming()
         self._pw_cm: Optional[AbstractContextManager[Playwright]] = None
         self._pw: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
+        self._last_kiot_rotate_at: Optional[float] = None
 
     def __enter__(self) -> ShopeeBrowserClient:
         self.start()
@@ -261,17 +272,50 @@ class ShopeeBrowserClient:
                 self._pw_cm = None
                 self._pw = None
 
-    def _new_browser_context(self) -> Tuple[BrowserContext, str]:
+    def _prepare_kiot_proxy_for_context(self) -> None:
         """
-        Một context = một phiên: UA + viewport ngẫu nhiên; nếu có KiotProxy thì
-        ``prepare_new_session()`` → IP mới (không tái dùng cùng IP cho số kế tiếp).
+        Đồng nhất logic xoay proxy:
+        - Nếu có ``kiot_rotate_after_seconds``: xoay theo chu kỳ này.
+        - Nếu không cấu hình chu kỳ: dựa vào thời gian Kiot trả về (ttc/nextRequestAt),
+          chỉ xoay khi đã tới lượt để tránh chờ ``TIME_TO_CHANGE_INVALID``.
         """
-        assert self.browser is not None
-        if self.kiot_proxy is not None:
-            if self.rotate_kiot_each_session:
+        if self.kiot_proxy is None:
+            return
+        if not self.rotate_kiot_each_session:
+            self.kiot_proxy.ensure_valid()
+            return
+
+        now = time.time()
+        if self.kiot_rotate_after_seconds > 0:
+            if (
+                self._last_kiot_rotate_at is None
+                or (now - self._last_kiot_rotate_at) >= self.kiot_rotate_after_seconds
+            ):
                 self.kiot_proxy.prepare_new_session()
+                self._last_kiot_rotate_at = now
             else:
                 self.kiot_proxy.ensure_valid()
+            return
+
+        self.kiot_proxy.ensure_valid()
+        timing = self.kiot_proxy.rotation_timing() or {}
+        can_new_in = timing.get("seconds_until_can_request_new")
+        ttc = timing.get("ttc_seconds_until_next_change")
+        if (
+            isinstance(can_new_in, (int, float)) and can_new_in <= 0.0
+        ) or (
+            isinstance(ttc, (int, float)) and ttc <= 0.0
+        ):
+            self.kiot_proxy.prepare_new_session()
+            self._last_kiot_rotate_at = now
+
+    def _new_browser_context(self) -> Tuple[BrowserContext, str]:
+        """
+        Một context = một phiên: UA + viewport ngẫu nhiên.
+        Nếu có KiotProxy: dùng logic xoay thông minh để tránh bị chờ do gọi đổi quá sớm.
+        """
+        assert self.browser is not None
+        self._prepare_kiot_proxy_for_context()
 
         ua = random_user_agent()
         viewport = random_viewport()
@@ -636,6 +680,15 @@ if __name__ == "__main__":
         help="Không gọi prepare_new_session giữa các số (cùng IP cho cả batch — không khuyến nghị).",
     )
     parser.add_argument(
+        "--kiot-rotate-after",
+        type=float,
+        default=float(os.environ.get("KIOT_ROTATE_AFTER_SECONDS", "0") or 0),
+        help=(
+            "Xoay Kiot theo số giây cố định (0 = dùng ttc/nextRequestAt từ API để "
+            "tránh gọi đổi quá sớm). Có thể đặt qua KIOT_ROTATE_AFTER_SECONDS."
+        ),
+    )
+    parser.add_argument(
         "--kiot-verify",
         action="store_true",
         help="Chỉ gọi Kiot GET /proxies/new rồi thoát (kiểm tra Proxy Key, không mở browser).",
@@ -652,10 +705,7 @@ if __name__ == "__main__":
 
     phones = [
         "84565132248",
-        "84568527580",
-        "84941211761",
-        "84563414553",
-        "84359663964",
+        "84568527580"
     ]
 
     # headless mặc định: không hiện cửa sổ. Nếu Shopee siết headless: thử --headed hoặc giảm tốc độ.
@@ -672,6 +722,7 @@ if __name__ == "__main__":
         use_system_chrome=args.chrome,
         kiot_proxy=kiot,
         rotate_kiot_each_session=not args.reuse_proxy_ip,
+        kiot_rotate_after_seconds=args.kiot_rotate_after,
         debug_dir=args.debug_dir,
         timing=timing,
     ) as client:
